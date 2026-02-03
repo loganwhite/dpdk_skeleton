@@ -265,16 +265,25 @@ l2fwd_main_loop(void *dummy)
 			rte_ether_addr_copy(&eth->d_addr, &tmp);
 			rte_ether_addr_copy(&eth->s_addr, &eth->d_addr);
 			rte_ether_addr_copy(&tmp, &eth->s_addr);
-
-			rte_eth_tx_burst(portid, q_id, &m, 1);
-#ifdef XSTATS_ENABLE
-			lcore_statistics[lcore_id].tx_pkts += 1;
-#endif
 		}
 #ifdef XSTATS_ENABLE
 		/* 批量更新字节数，减少内存写次数 */
         lcore_statistics[lcore_id].rx_bytes += bytes_batch;
 #endif
+		/* 发送数据包 */
+		uint16_t nb_tx = rte_eth_tx_burst(portid, q_id, pkts_burst, nb_rx);
+
+		/* 释放未发送的数据包 */
+		if (unlikely(nb_tx < nb_rx)) {
+			for (j = nb_tx; j < nb_rx; j++)
+				rte_pktmbuf_free(pkts_burst[j]);
+		}
+#ifdef XSTATS_ENABLE
+		/* 统计已发送数据包 */
+		lcore_statistics[lcore_id].tx_pkts += nb_tx;
+		/* 注意：这里没有统计字节数，可以根据需要添加 */
+#endif
+
 	}
 	return 0;
 }

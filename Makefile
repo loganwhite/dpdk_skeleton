@@ -37,10 +37,10 @@ LDFLAGS=-libverbs
 # and so the next line can be removed in those cases.
 EXTRA_CFLAGS += -fno-strict-aliasing
 EXTRA_CFLAGS += -pthread
-EXTRA_CFLAGS += -g
-#EXTRA_CFLAGS += -O3
+# EXTRA_CFLAGS += -g
+EXTRA_CFLAGS += -O3
 #EXTRA_CFLAGS += -DTIMERSTAT
 #EXTRA_CFLAGS += -DTIMEFUNC
-# EXTRA_CFLAGS += -DXSTATS_ENABLE
+EXTRA_CFLAGS += -DXSTATS_ENABLE
 
 include $(RTE_SDK)/mk/rte.extapp.mk
