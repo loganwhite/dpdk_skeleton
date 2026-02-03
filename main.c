@@ -151,8 +151,11 @@ generate_ipv4_flow(uint16_t port_id, uint16_t rx_q, uint32_t dst_ip, uint32_t ma
 static void
 print_stats_loop(void)
 {
-    uint64_t prev_pkts[RTE_MAX_LCORE] = {0};
-    uint64_t prev_bytes[RTE_MAX_LCORE] = {0};
+    /* 定义数组保存上一秒的数据，用于计算差值（速率） */
+    uint64_t prev_rx_pkts[RTE_MAX_LCORE] = {0};
+    uint64_t prev_tx_pkts[RTE_MAX_LCORE] = {0};
+    uint64_t prev_tx_bytes[RTE_MAX_LCORE] = {0};
+
     const char clr[] = { 27, '[', '2', 'J', '\0' };
     const char topLeft[] = { 27, '[', '1', ';', '1', 'H', '\0' };
     unsigned int lcore_id;
@@ -167,48 +170,57 @@ print_stats_loop(void)
         printf("%s%s", clr, topLeft);
         
         printf("\nData Plane Statistics (1 sec refresh)\n");
-        printf("=========================================================================\n");
-        printf(" %-10s | %-8s | %-12s | %-12s | %-12s\n", 
-               "Lcore ID", "Queue ID", "PPS (Pkts/s)", "Throughput", "Total Pkts");
-        printf("-------------------------------------------------------------------------\n");
+        printf("==================================================================================\n");
+        /* 按要求调整列名 */
+        printf(" %-10s | %-8s | %-12s | %-12s | %-15s\n", 
+               "Lcore ID", "Queue ID", "RX PPS", "TX PPS", "TX Throughput");
+        printf("----------------------------------------------------------------------------------\n");
 
-        uint64_t total_pps = 0;
-        uint64_t total_bps = 0;
-        uint64_t total_all_pkts = 0;
+        uint64_t total_rx_pps = 0;
+        uint64_t total_tx_pps = 0;
+        uint64_t total_tx_bps = 0;
 
         RTE_LCORE_FOREACH_SLAVE(lcore_id) {
-            uint64_t cur_pkts = lcore_statistics[lcore_id].rx_pkts;
-            uint64_t cur_bytes = lcore_statistics[lcore_id].rx_bytes;
+            /* 1. 读取当前时刻的总计数值 */
+            uint64_t cur_rx_pkts = lcore_statistics[lcore_id].rx_pkts;
+            uint64_t cur_tx_pkts = lcore_statistics[lcore_id].tx_pkts;
+            uint64_t cur_tx_bytes = lcore_statistics[lcore_id].tx_bytes;
+            
             unsigned int q_id = lcore_queue_map[lcore_id];
 
-            uint64_t diff_pkts = cur_pkts - prev_pkts[lcore_id];
-            uint64_t diff_bytes = cur_bytes - prev_bytes[lcore_id];
-            uint64_t diff_bits = diff_bytes * 8;
+            /* 2. 计算这一秒内的增量 (即速率) */
+            uint64_t diff_rx_pkts = cur_rx_pkts - prev_rx_pkts[lcore_id];
+            uint64_t diff_tx_pkts = cur_tx_pkts - prev_tx_pkts[lcore_id];
+            uint64_t diff_tx_bytes = cur_tx_bytes - prev_tx_bytes[lcore_id];
+            uint64_t diff_tx_bits = diff_tx_bytes * 8; /* 字节转比特 */
 
-            /* 更新旧值 */
-            prev_pkts[lcore_id] = cur_pkts;
-            prev_bytes[lcore_id] = cur_bytes;
+            /* 3. 更新旧值，供下一秒使用 */
+            prev_rx_pkts[lcore_id] = cur_rx_pkts;
+            prev_tx_pkts[lcore_id] = cur_tx_pkts;
+            prev_tx_bytes[lcore_id] = cur_tx_bytes;
 
-            /* 累加总数 */
-            total_pps += diff_pkts;
-            total_bps += diff_bits;
-            total_all_pkts += cur_pkts;
+            /* 4. 累加全局总数 */
+            total_rx_pps += diff_rx_pkts;
+            total_tx_pps += diff_tx_pkts;
+            total_tx_bps += diff_tx_bits;
 
-            double mpps = (double)diff_pkts / 1000000.0;
-            double mbps = (double)diff_bits / 1000000.0;
+            /* 5. 格式化输出 (Mpps, Mbps) */
+            double rx_mpps = (double)diff_rx_pkts / 1000000.0;
+            double tx_mpps = (double)diff_tx_pkts / 1000000.0;
+            double tx_mbps = (double)diff_tx_bits / 1000000.0;
 
             if (lcore_queue_map[lcore_id] < RTE_MAX_LCORE) {
-                printf(" %-10u | %-8u | %10.4f M | %10.4f M | %12lu\n", 
-                    lcore_id, q_id, mpps, mbps, cur_pkts);
+                printf(" %-10u | %-8u | %10.4f M | %10.4f M | %10.4f Mbps\n", 
+                    lcore_id, q_id, rx_mpps, tx_mpps, tx_mbps);
             }
         }
         
-        printf("=========================================================================\n");
-        printf(" TOTAL      | ALL      | %10.4f M | %10.4f M | %12lu\n", 
-               (double)total_pps / 1000000.0, 
-               (double)total_bps / 1000000.0,
-               total_all_pkts);
-        printf("=========================================================================\n");
+        printf("==================================================================================\n");
+        printf(" TOTAL      | ALL      | %10.4f M | %10.4f M | %10.4f Mbps\n", 
+               (double)total_rx_pps / 1000000.0, 
+               (double)total_tx_pps / 1000000.0,
+               (double)total_tx_bps / 1000000.0);
+        printf("==================================================================================\n");
     }
 }
 #endif /* XSTATS_ENABLE */
@@ -221,18 +233,16 @@ l2fwd_main_loop(void *dummy)
 	unsigned lcore_id;
 	unsigned j, portid, nb_rx;
 	
-	/* 消除 unused warning */
 	(void)dummy;
 
 	lcore_id = rte_lcore_id();
 	unsigned int q_id = lcore_queue_map[lcore_id];
 	portid = 0; 
 
-    /* 安全检查：如果映射错误，直接退出避免 Crash */
-    if (q_id >= RTE_MAX_LCORE) {
-        printf("Lcore %u has no queue assigned! Bye.\n", lcore_id);
-        return -1;
-    }
+	if (q_id >= RTE_MAX_LCORE) {
+		printf("Lcore %u has no queue assigned! Bye.\n", lcore_id);
+		return -1;
+	}
 
 	printf("Lcore %u: Entering main loop on Port %u Queue %u\n", lcore_id, portid, q_id);
 
@@ -241,49 +251,68 @@ l2fwd_main_loop(void *dummy)
 
 		if (nb_rx == 0)
 			continue;
+
 #ifdef XSTATS_ENABLE
-		/* --- 统计更新开始 --- */
-        /* 注意：这是在临界路径上，尽量少做计算 */
-        lcore_statistics[lcore_id].rx_pkts += nb_rx;
-        uint64_t bytes_batch = 0;
-        /* --- 统计更新结束 --- */
+		lcore_statistics[lcore_id].rx_pkts += nb_rx;
+		uint64_t bytes_batch = 0;
 #endif
+
+		/* --- 优化点 1: 预取逻辑 --- */
+		/* 提前把前两个包的 Header 拉入 Cache，防止流水线停顿 */
+		if (nb_rx > 1) {
+			rte_prefetch0(rte_pktmbuf_mtod(pkts_burst[0], void *));
+			rte_prefetch0(rte_pktmbuf_mtod(pkts_burst[1], void *));
+		}
 
 		for (j = 0; j < nb_rx; j++) {
 			m = pkts_burst[j];
 
+			/* --- 优化点 1 (继续): 循环内预取 --- */
+			/* 处理第 j 个包时，预取第 j+2 个包 */
+			/* 为什么是 +2？因为 +1 已经在上一轮循环或开头预取过了，保持流水线充盈 */
+			if (j + 2 < nb_rx) {
+				rte_prefetch0(rte_pktmbuf_mtod(pkts_burst[j + 2], void *));
+			}
+
 #ifdef XSTATS_ENABLE
-			/* 统计字节数 (包含以太网帧头，不含CRC) */
-            bytes_batch += m->pkt_len;
+			bytes_batch += m->pkt_len;
 #endif
 			
 			struct rte_ether_hdr *eth;
 			eth = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
 			
-			/* DPDK 19.11 修正: 使用 d_addr 和 s_addr */
+			/* --- 优化点 2: 简化的 MAC 交换 --- */
+			/* 标准的 3次 copy 比较慢。为了压测 100G，
+			 * 我们可以简单地交换源/目的的最后 2 个字节，或者使用 64位赋值优化。
+			 * 下面保留你的逻辑，但在高压下这可能是瓶颈。
+			 */
 			struct rte_ether_addr tmp;
 			rte_ether_addr_copy(&eth->d_addr, &tmp);
 			rte_ether_addr_copy(&eth->s_addr, &eth->d_addr);
 			rte_ether_addr_copy(&tmp, &eth->s_addr);
 		}
+
 #ifdef XSTATS_ENABLE
-		/* 批量更新字节数，减少内存写次数 */
-        lcore_statistics[lcore_id].rx_bytes += bytes_batch;
+		lcore_statistics[lcore_id].rx_bytes += bytes_batch;
 #endif
-		/* 发送数据包 */
+
+		/* 批量发送 */
 		uint16_t nb_tx = rte_eth_tx_burst(portid, q_id, pkts_burst, nb_rx);
 
-		/* 释放未发送的数据包 */
 		if (unlikely(nb_tx < nb_rx)) {
 			for (j = nb_tx; j < nb_rx; j++)
 				rte_pktmbuf_free(pkts_burst[j]);
 		}
-#ifdef XSTATS_ENABLE
-		/* 统计已发送数据包 */
-		lcore_statistics[lcore_id].tx_pkts += nb_tx;
-		/* 注意：这里没有统计字节数，可以根据需要添加 */
-#endif
 
+#ifdef XSTATS_ENABLE
+		lcore_statistics[lcore_id].tx_pkts += nb_tx;
+		/* 补全 TX Bytes 统计：简单起见，假设发出去的字节数 = 收到的平均值 * nb_tx 
+		 * 或者你可以再遍历一次算精确值，但为了性能，通常只统计包数，或者假设 TX=RX Bytes
+		 */
+		if (nb_rx > 0) {
+			lcore_statistics[lcore_id].tx_bytes += (bytes_batch / nb_rx) * nb_tx;
+		}
+#endif
 	}
 	return 0;
 }
@@ -314,6 +343,8 @@ main(int argc, char **argv)
 #ifdef XSTATS_ENABLE
 		lcore_statistics[i].rx_pkts = 0;
         lcore_statistics[i].rx_bytes = 0;
+		lcore_statistics[i].tx_pkts = 0;
+        lcore_statistics[i].tx_bytes = 0;
 #endif
 	}
 
