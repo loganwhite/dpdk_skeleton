@@ -18,7 +18,7 @@ please change the definition of the RTE_TARGET environment variable)
 endif
 
 # binary name
-APP = sketchlet
+APP = skeleton
 
 # all source are in the current directory
 SRCS-y := main.c
