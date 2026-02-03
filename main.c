@@ -48,7 +48,7 @@
 #define NB_MBUF 8192
 #define NUM_FLOWS 254
 
-
+#ifdef XSTATS_ENABLE
 /* * 统计结构体
  * 使用 __rte_cache_aligned 强制对齐到 Cache Line (通常 64字节)
  * 这样 Core A 写自己的计数器时，不会因为 Cache Coherency 协议影响 Core B
@@ -60,6 +60,8 @@ struct lcore_stats {
 	uint64_t tx_bytes;
 } __rte_cache_aligned;
 static struct lcore_stats lcore_statistics[RTE_MAX_LCORE];
+#endif
+
 
 static unsigned int lcore_queue_map[RTE_MAX_LCORE];
 
@@ -143,6 +145,8 @@ generate_ipv4_flow(uint16_t port_id, uint16_t rx_q, uint32_t dst_ip, uint32_t ma
 	return flow;
 }
 
+#ifdef XSTATS_ENABLE
+
 /* 打印统计信息的循环 (运行在 Master Core) */
 static void
 print_stats_loop(void)
@@ -207,6 +211,7 @@ print_stats_loop(void)
         printf("=========================================================================\n");
     }
 }
+#endif /* XSTATS_ENABLE */
 
 static int
 l2fwd_main_loop(void *dummy)
@@ -236,18 +241,21 @@ l2fwd_main_loop(void *dummy)
 
 		if (nb_rx == 0)
 			continue;
-		
+#ifdef XSTATS_ENABLE
 		/* --- 统计更新开始 --- */
         /* 注意：这是在临界路径上，尽量少做计算 */
         lcore_statistics[lcore_id].rx_pkts += nb_rx;
         uint64_t bytes_batch = 0;
         /* --- 统计更新结束 --- */
+#endif
 
 		for (j = 0; j < nb_rx; j++) {
 			m = pkts_burst[j];
 
+#ifdef XSTATS_ENABLE
 			/* 统计字节数 (包含以太网帧头，不含CRC) */
             bytes_batch += m->pkt_len;
+#endif
 			
 			struct rte_ether_hdr *eth;
 			eth = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
@@ -259,10 +267,14 @@ l2fwd_main_loop(void *dummy)
 			rte_ether_addr_copy(&tmp, &eth->s_addr);
 
 			rte_eth_tx_burst(portid, q_id, &m, 1);
+#ifdef XSTATS_ENABLE
 			lcore_statistics[lcore_id].tx_pkts += 1;
+#endif
 		}
+#ifdef XSTATS_ENABLE
 		/* 批量更新字节数，减少内存写次数 */
         lcore_statistics[lcore_id].rx_bytes += bytes_batch;
+#endif
 	}
 	return 0;
 }
@@ -289,8 +301,11 @@ main(int argc, char **argv)
     /* 初始化映射表为无效值 */
     for (int i = 0; i < RTE_MAX_LCORE; i++) {
 		lcore_queue_map[i] = RTE_MAX_LCORE;
+
+#ifdef XSTATS_ENABLE
 		lcore_statistics[i].rx_pkts = 0;
         lcore_statistics[i].rx_bytes = 0;
+#endif
 	}
 
 	ret = rte_eal_init(argc, argv);
@@ -373,8 +388,10 @@ main(int argc, char **argv)
 
 	rte_eal_mp_remote_launch(l2fwd_main_loop, NULL, CALL_MASTER);
 
+#ifdef XSTATS_ENABLE
 	/* Master Core 运行统计循环 */
     print_stats_loop();
+#endif
 
 	/* 等待退出 */
 	RTE_LCORE_FOREACH_SLAVE(lcore_id) {
