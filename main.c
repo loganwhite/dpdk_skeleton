@@ -390,6 +390,10 @@ main(int argc, char **argv)
 	port_conf.rx_adv_conf.rss_conf.rss_key = NULL;
 	port_conf.rx_adv_conf.rss_conf.rss_hf = ETH_RSS_IP;
 
+	port_conf.rxmode.offloads &= ~DEV_RX_OFFLOAD_SCATTER;
+    port_conf.rxmode.offloads &= ~DEV_RX_OFFLOAD_TCP_LRO;
+	port_conf.rxmode.offloads &= ~DEV_RX_OFFLOAD_VLAN_STRIP;
+
 	ret = rte_eth_dev_configure(portid, nb_forwarding_cores, nb_forwarding_cores, &port_conf);
 	if (ret < 0)
 		rte_exit(EXIT_FAILURE, "Cannot configure device: err=%d, port=%u\n", ret, portid);
