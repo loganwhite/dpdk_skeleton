@@ -42,18 +42,47 @@
 #include <rte_flow.h>
 #include <rte_ip.h>
 
-#define MAX_PKT_BURST 32
-#define MEMPOOL_CACHE_SIZE 256
+#define MAX_PKT_BURST 64
+#define MEMPOOL_CACHE_SIZE 4096
+#define NB_DESC 2048
 #define NB_MBUF 8192
 #define NUM_FLOWS 254
 
+
+/* * 统计结构体
+ * 使用 __rte_cache_aligned 强制对齐到 Cache Line (通常 64字节)
+ * 这样 Core A 写自己的计数器时，不会因为 Cache Coherency 协议影响 Core B
+ */
+struct lcore_stats {
+    uint64_t rx_pkts;
+    uint64_t rx_bytes;
+    uint64_t tx_pkts;
+	uint64_t tx_bytes;
+} __rte_cache_aligned;
+static struct lcore_stats lcore_statistics[RTE_MAX_LCORE];
+
 static unsigned int lcore_queue_map[RTE_MAX_LCORE];
+
+/* 强制停止标志 */
+static volatile bool force_quit;
 
 /* 手动定义 IPv4 宏，防止 implicit declaration 错误 */
 #define IPv4(a,b,c,d) ((uint32_t)(((a) & 0xff) << 24) | \
 					   (((b) & 0xff) << 16) | \
 					   (((c) & 0xff) << 8)  | \
 					   ((d) & 0xff))
+
+
+
+static void
+signal_handler(int signum)
+{
+    if (signum == SIGINT || signum == SIGTERM) {
+        printf("\n\nSignal %d received, preparing to exit...\n", signum);
+        force_quit = true;
+    }
+}
+
 
 static struct rte_flow *
 generate_ipv4_flow(uint16_t port_id, uint16_t rx_q, uint32_t dst_ip, uint32_t mask)
@@ -114,6 +143,71 @@ generate_ipv4_flow(uint16_t port_id, uint16_t rx_q, uint32_t dst_ip, uint32_t ma
 	return flow;
 }
 
+/* 打印统计信息的循环 (运行在 Master Core) */
+static void
+print_stats_loop(void)
+{
+    uint64_t prev_pkts[RTE_MAX_LCORE] = {0};
+    uint64_t prev_bytes[RTE_MAX_LCORE] = {0};
+    const char clr[] = { 27, '[', '2', 'J', '\0' };
+    const char topLeft[] = { 27, '[', '1', ';', '1', 'H', '\0' };
+    unsigned int lcore_id;
+
+    printf("Stats loop started on Master Core.\n");
+
+    while (!force_quit) {
+        /* 睡眠 1 秒 */
+        sleep(1);
+
+        /* 清屏 */
+        printf("%s%s", clr, topLeft);
+        
+        printf("\nData Plane Statistics (1 sec refresh)\n");
+        printf("=========================================================================\n");
+        printf(" %-10s | %-8s | %-12s | %-12s | %-12s\n", 
+               "Lcore ID", "Queue ID", "PPS (Pkts/s)", "Throughput", "Total Pkts");
+        printf("-------------------------------------------------------------------------\n");
+
+        uint64_t total_pps = 0;
+        uint64_t total_bps = 0;
+        uint64_t total_all_pkts = 0;
+
+        RTE_LCORE_FOREACH_SLAVE(lcore_id) {
+            uint64_t cur_pkts = lcore_statistics[lcore_id].rx_pkts;
+            uint64_t cur_bytes = lcore_statistics[lcore_id].rx_bytes;
+            unsigned int q_id = lcore_queue_map[lcore_id];
+
+            uint64_t diff_pkts = cur_pkts - prev_pkts[lcore_id];
+            uint64_t diff_bytes = cur_bytes - prev_bytes[lcore_id];
+            uint64_t diff_bits = diff_bytes * 8;
+
+            /* 更新旧值 */
+            prev_pkts[lcore_id] = cur_pkts;
+            prev_bytes[lcore_id] = cur_bytes;
+
+            /* 累加总数 */
+            total_pps += diff_pkts;
+            total_bps += diff_bits;
+            total_all_pkts += cur_pkts;
+
+            double mpps = (double)diff_pkts / 1000000.0;
+            double mbps = (double)diff_bits / 1000000.0;
+
+            if (lcore_queue_map[lcore_id] < RTE_MAX_LCORE) {
+                printf(" %-10u | %-8u | %10.4f M | %10.4f M | %12lu\n", 
+                    lcore_id, q_id, mpps, mbps, cur_pkts);
+            }
+        }
+        
+        printf("=========================================================================\n");
+        printf(" TOTAL      | ALL      | %10.4f M | %10.4f M | %12lu\n", 
+               (double)total_pps / 1000000.0, 
+               (double)total_bps / 1000000.0,
+               total_all_pkts);
+        printf("=========================================================================\n");
+    }
+}
+
 static int
 l2fwd_main_loop(void *dummy)
 {
@@ -137,14 +231,23 @@ l2fwd_main_loop(void *dummy)
 
 	printf("Lcore %u: Entering main loop on Port %u Queue %u\n", lcore_id, portid, q_id);
 
-	while (1) {
+	while (!force_quit) {
 		nb_rx = rte_eth_rx_burst(portid, q_id, pkts_burst, MAX_PKT_BURST);
 
 		if (nb_rx == 0)
 			continue;
+		
+		/* --- 统计更新开始 --- */
+        /* 注意：这是在临界路径上，尽量少做计算 */
+        lcore_statistics[lcore_id].rx_pkts += nb_rx;
+        uint64_t bytes_batch = 0;
+        /* --- 统计更新结束 --- */
 
 		for (j = 0; j < nb_rx; j++) {
 			m = pkts_burst[j];
+
+			/* 统计字节数 (包含以太网帧头，不含CRC) */
+            bytes_batch += m->pkt_len;
 			
 			struct rte_ether_hdr *eth;
 			eth = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
@@ -156,7 +259,10 @@ l2fwd_main_loop(void *dummy)
 			rte_ether_addr_copy(&tmp, &eth->s_addr);
 
 			rte_eth_tx_burst(portid, q_id, &m, 1);
+			lcore_statistics[lcore_id].tx_pkts += 1;
 		}
+		/* 批量更新字节数，减少内存写次数 */
+        lcore_statistics[lcore_id].rx_bytes += bytes_batch;
 	}
 	return 0;
 }
@@ -171,25 +277,42 @@ main(int argc, char **argv)
 	struct rte_eth_rxconf rxq_conf;
 	struct rte_eth_txconf txq_conf;
 	struct rte_eth_dev_info dev_info;
-	uint16_t nb_rxd = 1024;
-	uint16_t nb_txd = 1024;
+	uint16_t nb_rxd = NB_DESC;
+	uint16_t nb_txd = NB_DESC;
 	int ret;
 	unsigned int nb_lcores;
 
+	force_quit = false;
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+
     /* 初始化映射表为无效值 */
-    for (int i = 0; i < RTE_MAX_LCORE; i++)
-        lcore_queue_map[i] = RTE_MAX_LCORE;
+    for (int i = 0; i < RTE_MAX_LCORE; i++) {
+		lcore_queue_map[i] = RTE_MAX_LCORE;
+		lcore_statistics[i].rx_pkts = 0;
+        lcore_statistics[i].rx_bytes = 0;
+	}
 
 	ret = rte_eal_init(argc, argv);
 	if (ret < 0)
 		rte_exit(EXIT_FAILURE, "Invalid EAL arguments\n");
 
 	nb_lcores = rte_lcore_count();
-	printf("Number of lcores enabled: %u\n", nb_lcores);
+	/* 我们将 Master Core 用于显示统计，不用于转发，所以工作核数量 -1 */
+    unsigned int nb_forwarding_cores = nb_lcores - 1;
+    
+    printf("Total lcores: %u, Forwarding cores: %u, Stats core: 1\n", nb_lcores, nb_forwarding_cores);
+
+    if (nb_forwarding_cores == 0) {
+        rte_exit(EXIT_FAILURE, "Need at least 2 cores (1 for stats, 1+ for forwarding)\n");
+    }
 
     unsigned int rx_idx = 0;
+	unsigned int master_lcore = rte_get_master_lcore();
     unsigned lcore_id;
     RTE_LCORE_FOREACH(lcore_id) {
+		if (lcore_id == master_lcore)
+            continue; /* Master 不处理队列 */
         lcore_queue_map[lcore_id] = rx_idx;
         printf("Mapping: Lcore %u -> Queue %u\n", lcore_id, rx_idx);
         rx_idx++;
@@ -212,13 +335,13 @@ main(int argc, char **argv)
 	port_conf.rx_adv_conf.rss_conf.rss_key = NULL;
 	port_conf.rx_adv_conf.rss_conf.rss_hf = ETH_RSS_IP;
 
-	ret = rte_eth_dev_configure(portid, nb_lcores, nb_lcores, &port_conf);
+	ret = rte_eth_dev_configure(portid, nb_forwarding_cores, nb_forwarding_cores, &port_conf);
 	if (ret < 0)
 		rte_exit(EXIT_FAILURE, "Cannot configure device: err=%d, port=%u\n", ret, portid);
 
 	rxq_conf = dev_info.default_rxconf;
 	rxq_conf.offloads = port_conf.rxmode.offloads;
-	for (unsigned int q = 0; q < nb_lcores; q++) {
+	for (unsigned int q = 0; q < nb_forwarding_cores; q++) {
 		ret = rte_eth_rx_queue_setup(portid, q, nb_rxd, rte_eth_dev_socket_id(portid), &rxq_conf, mbuf_pool);
 		if (ret < 0)
 			rte_exit(EXIT_FAILURE, "rte_eth_rx_queue_setup:err=%d, port=%u\n", ret, portid);
@@ -226,7 +349,7 @@ main(int argc, char **argv)
 
 	txq_conf = dev_info.default_txconf;
 	txq_conf.offloads = port_conf.txmode.offloads;
-	for (unsigned int q = 0; q < nb_lcores; q++) {
+	for (unsigned int q = 0; q < nb_forwarding_cores; q++) {
 		ret = rte_eth_tx_queue_setup(portid, q, nb_txd, rte_eth_dev_socket_id(portid), &txq_conf);
 		if (ret < 0)
 			rte_exit(EXIT_FAILURE, "rte_eth_tx_queue_setup:err=%d, port=%u\n", ret, portid);
@@ -243,14 +366,17 @@ main(int argc, char **argv)
 		uint32_t target_ip = IPv4(48, 0, 0, 1 + i);
 		uint32_t full_mask = 0xFFFFFFFF;
 		
-		generate_ipv4_flow(portid, i % nb_lcores, target_ip, full_mask);
+		generate_ipv4_flow(portid, i % nb_forwarding_cores, target_ip, full_mask);
 	}
 	printf("--- Flow Rules Configured ---\n\n");
 
 
 	rte_eal_mp_remote_launch(l2fwd_main_loop, NULL, CALL_MASTER);
 
-	
+	/* Master Core 运行统计循环 */
+    print_stats_loop();
+
+	/* 等待退出 */
 	RTE_LCORE_FOREACH_SLAVE(lcore_id) {
 		if (rte_eal_wait_lcore(lcore_id) < 0)
 			return -1;
